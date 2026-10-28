@@ -1,0 +1,348 @@
+---
+title: "Exercício: SARIMA no comércio varejista brasileiro"
+subtitle: "UF: Pernambuco · PMC/IBGE, varejo ampliado, índice de volume sem ajuste sazonal"
+author: "Gustavo Jurema"
+lang: pt-BR
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    fig-width: 9
+    fig-height: 4.5
+execute:
+  warning: false
+  message: false
+jupyter: python3
+---
+
+## Sobre o exercício
+
+A base é a **PMC** (Pesquisa Mensal do Comércio) do IBGE: índice de volume de vendas no **comércio varejista ampliado** (inclui veículos e materiais de construção), por **Unidade da Federação**, mensal de jan/2004 em diante. Base 2022 = 100, **sem ajuste sazonal**.
+
+Roteiro aplicado a **Pernambuco**:
+
+1. Análise descritiva (linha, ACF, PACF, diferenciação) e diagnóstico de tendência/sazonalidade.
+2. Testes de raiz unitária (ADF, KPSS) e estimativa de `ndiffs`.
+3. Ajuste de SARIMA via `AutoARIMA(season_length=12)`.
+4. Diagnóstico dos resíduos.
+5. Previsão de 24 meses à frente, com intervalos de 80% e 95%.
+6. Discussão dos resultados.
+
+## Setup
+
+```{python}
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from statsmodels.tsa.stattools import adfuller, kpss
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.tools.sm_exceptions import InterpolationWarning
+
+from statsforecast import StatsForecast
+from statsforecast.models import AutoARIMA, ARIMA
+from statsforecast.arima import ndiffs, nsdiffs
+
+warnings.filterwarnings("ignore", category=InterpolationWarning)
+plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False, "axes.grid": True, "grid.alpha": 0.3})
+```
+
+## Carregando a base PMC
+
+A base já foi pré-processada para conter apenas as colunas relevantes, e já no formato "long" (uma linha por data + UF). O nome da coluna de data é "data", e a coluna de interesse (índice de volume) é "volume_idx". A coluna "uf" indica a Unidade da Federação.
+
+```{python}
+pmc = pd.read_csv("https://github.com/padsInsper/202634-fa/releases/download/data/pmc_volume_uf.csv")
+pmc.head()
+```
+
+## Escolha sua UF
+
+```{python}
+MINHA_UF = "Pernambuco"
+
+df_sf = (
+    pmc.query("uf == @MINHA_UF")
+    .rename(columns={"uf": "unique_id", "data": "ds", "volume_idx": "y"})
+    [["unique_id", "ds", "y"]]
+    .assign(ds=lambda d: pd.to_datetime(d["ds"]))
+    .sort_values("ds")
+    .reset_index(drop=True)
+)
+
+y = df_sf.set_index("ds")["y"].asfreq("MS")
+
+print(f"Período: {y.index.min():%m/%Y} a {y.index.max():%m/%Y} · {len(y)} meses · {y.isna().sum()} faltantes")
+df_sf.head()
+```
+
+## Análise descritiva
+
+### Série no tempo
+
+```{python}
+fig, ax = plt.subplots()
+ax.plot(y.index, y, lw=1.2, color="#1f4e79", label="Índice de volume")
+ax.plot(y.index, y.rolling(12, center=True).mean(), lw=2, color="#c0504d", label="Média móvel 12 meses")
+ax.axvspan(pd.Timestamp("2020-03-01"), pd.Timestamp("2020-06-01"), color="grey", alpha=0.2, label="Choque da pandemia")
+ax.set_title(f"PMC varejo ampliado · {MINHA_UF} (2022 = 100, sem ajuste sazonal)")
+ax.set_ylabel("Índice")
+ax.legend(loc="upper left")
+plt.show()
+```
+
+A série tem **tendência** clara e não constante: sobe até 2014, cai na recessão de 2015-2016, fica de lado até 2019, tem o vale da pandemia em abril/2020 e retoma depois. Por cima disso há um **padrão sazonal forte**, com pico todo dezembro.
+
+### Perfil sazonal
+
+```{python}
+saz = df_sf.assign(mes=df_sf["ds"].dt.month, ano=df_sf["ds"].dt.year)
+# remove o nível de cada ano para isolar o efeito do mês
+saz["rel"] = saz["y"] / saz.groupby("ano")["y"].transform("mean") * 100
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+saz.boxplot(column="rel", by="mes", ax=axes[0], grid=False)
+axes[0].axhline(100, color="grey", lw=0.8, ls="--")
+axes[0].set_title("Índice relativo à média do ano, por mês")
+axes[0].set_xlabel("Mês"); axes[0].set_ylabel("% da média anual")
+
+for ano, g in saz.groupby("ano"):
+    if ano in (2006, 2012, 2019, 2023, 2025):
+        axes[1].plot(g["mes"], g["y"], marker="o", ms=3, label=ano)
+axes[1].set_title("Ano a ano (anos selecionados)")
+axes[1].set_xlabel("Mês"); axes[1].legend(fontsize=8)
+plt.suptitle("")
+plt.tight_layout(); plt.show()
+
+saz.groupby("mes")["rel"].mean().round(1).to_frame("média (% da média anual)").T
+```
+
+Dezembro fica cerca de 25% acima da média do ano (Natal e 13º salário) e fevereiro é o mês mais fraco (mês curto e Carnaval). O formato se repete em todos os anos, só muda o nível: sazonalidade **estável e multiplicativa leve**.
+
+### ACF e PACF da série original
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.8))
+plot_acf(y, lags=48, ax=axes[0], title="ACF · série original")
+plot_pacf(y, lags=48, ax=axes[1], method="ywm", title="PACF · série original")
+plt.tight_layout(); plt.show()
+```
+
+A ACF decai **muito devagar** (todas as defasagens significativas até 48 meses), assinatura de série não estacionária com tendência. Os "morros" em 12, 24, 36 e 48 mostram a sazonalidade anual por cima dessa tendência.
+
+### Diferenciação
+
+```{python}
+dy = y.diff().dropna()                 # diferença regular (1 - B)
+d12 = y.diff(12).dropna()              # diferença sazonal (1 - B^12)
+d1d12 = y.diff(12).diff().dropna()     # as duas: (1 - B)(1 - B^12)
+
+fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+for ax, s, t in zip(axes, [dy, d12, d1d12], ["Δ y (regular)", "Δ12 y (sazonal)", "Δ Δ12 y (regular + sazonal)"]):
+    ax.plot(s.index, s, lw=1, color="#1f4e79")
+    ax.axhline(0, color="grey", lw=0.8)
+    ax.set_title(t)
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+fig, axes = plt.subplots(3, 2, figsize=(11, 9))
+for i, (s, t) in enumerate([(dy, "Δ y"), (d12, "Δ12 y"), (d1d12, "Δ Δ12 y")]):
+    plot_acf(s, lags=48, ax=axes[i, 0], title=f"ACF · {t}")
+    plot_pacf(s, lags=48, ax=axes[i, 1], method="ywm", title=f"PACF · {t}")
+plt.tight_layout(); plt.show()
+```
+
+- **Só Δ y**: some a tendência, mas a ACF continua com picos enormes em 12, 24, 36… A sazonalidade segue lá.
+- **Só Δ12 y**: tira a sazonalidade, mas a ACF ainda decai devagar nos primeiros lags (sobra persistência de nível).
+- **Δ Δ12 y**: série em torno de zero; a ACF tem pico negativo no lag 1 e no lag 12 e pouca coisa além disso. Esse padrão é o "modelo das companhias aéreas": MA(1) regular e MA(1) sazonal sobre (1,1)×(1,1).
+
+## Testes de raiz unitária
+
+ADF: H0 = **tem** raiz unitária (não estacionária). KPSS: H0 = **é** estacionária. As duas hipóteses são opostas, então a conclusão é firme quando os dois concordam.
+
+```{python}
+def testes(serie, nome):
+    adf_p = adfuller(serie, autolag="AIC")[1]
+    kpss_p = kpss(serie, regression="c", nlags="auto")[1]
+    return {
+        "série": nome,
+        "ADF p-valor": round(adf_p, 4),
+        "KPSS p-valor": round(kpss_p, 4),
+        "conclusão": "estacionária" if (adf_p < 0.05 and kpss_p > 0.05)
+                     else "não estacionária" if (adf_p >= 0.05 and kpss_p <= 0.05)
+                     else "inconclusivo",
+    }
+
+tab = pd.DataFrame([
+    testes(y, "original"),
+    testes(dy, "Δ y"),
+    testes(d12, "Δ12 y"),
+    testes(d1d12, "Δ Δ12 y"),
+])
+tab
+```
+
+O KPSS da statsmodels só tabela p-valores entre 0,01 e 0,10: "0,01" significa "≤ 0,01" e "0,1" significa "≥ 0,10".
+
+```{python}
+d_reg = ndiffs(y.values, test="kpss")
+d_saz = nsdiffs(y.values, period=12)
+d_reg_apos_saz = ndiffs(d12.values, test="kpss")
+
+print(f"ndiffs (regular, KPSS) na série original:      {d_reg}")
+print(f"nsdiffs (sazonal, teste de força sazonal):      {d_saz}")
+print(f"ndiffs depois da diferença sazonal:             {d_reg_apos_saz}")
+```
+
+Na série original, ADF não rejeita a raiz unitária e KPSS rejeita a estacionariedade: **não estacionária**. Depois da diferença sazonal, o KPSS ainda diz que falta uma diferença regular. A combinação **d = 1, D = 1** é a indicada, e é a mesma que o AutoARIMA escolhe abaixo.
+
+## Modelagem
+
+```{python}
+sf = StatsForecast(models=[AutoARIMA(season_length=12)], freq="MS", n_jobs=1)
+sf.fit(df_sf)
+
+modelo = sf.fitted_[0, 0].model_
+p, q, P, Q, m, d, D = modelo["arma"]
+print(f"Modelo escolhido: SARIMA({p},{d},{q})({P},{D},{Q})[{m}]")
+print(f"AICc = {modelo['aicc']:.1f} · sigma² = {modelo['sigma2']:.2f}")
+
+coefs = pd.Series(modelo["coef"]).to_frame("coeficiente")
+var = np.diag(modelo["var_coef"])
+coefs["erro padrão"] = np.sqrt(var)
+coefs["z"] = coefs["coeficiente"] / coefs["erro padrão"]
+coefs.round(3)
+```
+
+O AutoARIMA escolheu **SARIMA(1,1,1)(0,1,2)[12]**:
+
+- **d = 1 e D = 1**: uma diferença regular (tendência) e uma sazonal (padrão anual). Bate com ADF/KPSS e com `ndiffs`/`nsdiffs`.
+- **MA(1) regular negativo e forte** (≈ −0,71) e **SMA(1) negativo** (≈ −0,65): são os picos negativos no lag 1 e no lag 12 da ACF de Δ Δ12 y.
+- **AR(1)** (≈ 0,42) compensa parte da sobrediferenciação. O SMA(2) é pequeno (≈ −0,10, |z| ≈ 1,5) e não é significativo a 5%: é um ajuste fino.
+
+### Comparação com o "modelo das companhias aéreas"
+
+Teste rápido: o SARIMA(0,1,1)(0,1,1)[12], que a ACF diferenciada sugeria a olho, perde para o modelo escolhido?
+
+```{python}
+sf_air = StatsForecast(models=[ARIMA(order=(0, 1, 1), seasonal_order=(0, 1, 1), season_length=12, alias="Airline")], freq="MS")
+sf_air.fit(df_sf)
+air = sf_air.fitted_[0, 0].model_
+pd.DataFrame({
+    "modelo": ["AutoARIMA (1,1,1)(0,1,2)", "Airline (0,1,1)(0,1,1)"],
+    "AICc": [round(modelo["aicc"], 1), round(air["aicc"], 1)],
+})
+```
+
+O AutoARIMA fica cerca de 4 pontos de AICc abaixo do airline: o AR(1) ajuda, mas a estrutura de base é a mesma que a leitura da ACF sugeria.
+
+## Diagnóstico dos resíduos
+
+```{python}
+res = pd.Series(modelo["residuals"], index=y.index)
+res_util = res.iloc[13:]   # descarta o período "queimado" pelas diferenças (1 + 12)
+
+fig = plt.figure(figsize=(11, 7))
+ax1 = fig.add_subplot(2, 1, 1)
+ax1.plot(res_util.index, res_util, lw=1, color="#1f4e79")
+ax1.axhline(0, color="grey", lw=0.8)
+ax1.set_title("Resíduos no tempo")
+ax2 = fig.add_subplot(2, 2, 3)
+ax2.hist(res_util, bins=30, color="#1f4e79", alpha=0.8)
+ax2.set_title("Histograma")
+ax3 = fig.add_subplot(2, 2, 4)
+plot_acf(res_util, lags=36, ax=ax3, title="ACF dos resíduos")
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+lb = acorr_ljungbox(res_util, lags=[12, 24, 36], model_df=p + q + P + Q)
+lb.round(3)
+```
+
+```{python}
+print("Maiores resíduos em valor absoluto:")
+res_util.abs().sort_values(ascending=False).head(5).round(1)
+```
+
+O teste de Ljung-Box não rejeita ruído branco a 5% em 12, 24 e 36 defasagens, e a ACF dos resíduos não mostra picos em 12 ou 24: **não sobra sazonalidade**. Três dos cinco maiores resíduos são de 2020 (fechamento do comércio em março/abril e reabertura em julho). Esses meses deixam o histograma com caudas mais pesadas que a normal, o que faz os intervalos de previsão serem um pouco otimistas.
+
+## Previsão · 24 meses à frente
+
+```{python}
+H = 24
+prev = sf.predict(h=H, level=[80, 95])
+
+hist = df_sf[df_sf["ds"] >= "2019-01-01"]
+fig, ax = plt.subplots(figsize=(10, 4.5))
+ax.plot(hist["ds"], hist["y"], color="#1f4e79", lw=1.2, label="Observado")
+ax.fill_between(prev["ds"], prev["AutoARIMA-lo-95"], prev["AutoARIMA-hi-95"], color="#c0504d", alpha=0.15, label="IC 95%")
+ax.fill_between(prev["ds"], prev["AutoARIMA-lo-80"], prev["AutoARIMA-hi-80"], color="#c0504d", alpha=0.30, label="IC 80%")
+ax.plot(prev["ds"], prev["AutoARIMA"], color="#c0504d", lw=1.8, label="Previsão")
+ax.set_title(f"Previsão SARIMA({p},{d},{q})({P},{D},{Q})[12] · {MINHA_UF} · {H} meses")
+ax.set_ylabel("Índice (2022 = 100)")
+ax.legend(loc="upper left", fontsize=9)
+plt.show()
+```
+
+```{python}
+tab_prev = prev.drop(columns="unique_id").assign(ds=lambda d: d["ds"].dt.strftime("%m/%Y"))
+tab_prev["amplitude IC 95%"] = tab_prev["AutoARIMA-hi-95"] - tab_prev["AutoARIMA-lo-95"]
+tab_prev.round(1).set_index("ds")
+```
+
+```{python}
+ult12 = y.iloc[-12:].mean()
+prox12 = prev["AutoARIMA"].iloc[:12].mean()
+seg12 = prev["AutoARIMA"].iloc[12:].mean()
+print(f"Média dos últimos 12 meses observados:  {ult12:.1f}")
+print(f"Média prevista para os próximos 12:     {prox12:.1f}  ({prox12 / ult12 - 1:+.1%})")
+print(f"Média prevista para os 12 seguintes:    {seg12:.1f}  ({seg12 / prox12 - 1:+.1%})")
+```
+
+### Comparação com outras UFs
+
+Para apoiar a pergunta 5 da discussão, o mesmo `AutoARIMA` aplicado a estados de perfis diferentes:
+
+```{python}
+def resumo_uf(uf):
+    d = (pmc.query("uf == @uf")
+         .rename(columns={"uf": "unique_id", "data": "ds", "volume_idx": "y"})
+         .assign(ds=lambda x: pd.to_datetime(x["ds"])))
+    sf_uf = StatsForecast(models=[AutoARIMA(season_length=12)], freq="MS")
+    sf_uf.fit(d)
+    mod = sf_uf.fitted_[0, 0].model_
+    p_, q_, P_, Q_, _, d_, D_ = mod["arma"]
+    yy = d["y"].values
+    rel = d.assign(ano=d["ds"].dt.year, mes=d["ds"].dt.month)
+    rel["r"] = rel["y"] / rel.groupby("ano")["y"].transform("mean")
+    return {
+        "UF": uf,
+        "modelo": f"({p_},{d_},{q_})({P_},{D_},{Q_})[12]",
+        "cresc. médio a.a.": f"{(yy[-12:].mean() / yy[:12].mean()) ** (12 / (len(yy) - 12)) - 1:.1%}",
+        "dezembro / média do ano": round(rel.groupby("mes")["r"].mean()[12], 2),
+        "desvio do choque / nível": round(np.sqrt(mod["sigma2"]) / yy[-12:].mean(), 3),
+    }
+
+pd.DataFrame([resumo_uf(u) for u in
+              ["Pernambuco", "São Paulo", "Goiás", "Mato Grosso", "Tocantins", "Roraima", "Amapá"]]).set_index("UF")
+```
+
+## Discussão
+
+**1. Sazonalidade e tendência no ACF/PACF.** Sim para as duas. A ACF da série original decai muito devagar, sinal de tendência estocástica, e tem morros nos lags 12, 24, 36 e 48, sinal de sazonalidade anual. Bate com o gráfico de linha: nível que sobe, cai em 2015-16 e retoma, e um pico de dezembro que se repete todo ano.
+
+**2. Diferenças e componentes AR/MA.** O AutoARIMA aplicou **uma diferença regular e uma sazonal** (d = 1, D = 1), a mesma conclusão de ADF/KPSS, `ndiffs` e `nsdiffs`. Escolheu AR(1), MA(1) e SMA(2). Os picos negativos nos lags 1 e 12 da ACF de Δ Δ12 y já apontavam para MA(1) e SMA(1). O AR(1) e o segundo termo sazonal são ajustes finos: o modelo "airline" (0,1,1)(0,1,1) fica só cerca de 4 pontos de AICc atrás.
+
+**3. Resíduos.** Se comportam como ruído branco: Ljung-Box não rejeita em 12, 24 e 36 defasagens e não há pico sazonal remanescente na ACF. Há dois pontos fracos. O choque da pandemia em 2020 gera resíduos extremos e caudas pesadas, que o SARIMA trata como choques aleatórios comuns. E a variância dos resíduos é visivelmente maior de 2020 em diante do que antes: o modelo assume variância constante, então os intervalos de previsão tendem a ser estreitos demais.
+
+**4. Previsão.** Visualmente razoável. Reproduz o pico de dezembro e o vale de fevereiro, começa ancorada no nível recente e projeta uma tendência suave de alta, herdada da combinação d = 1 + D = 1. Os intervalos abrem bastante com o horizonte, porque com duas diferenças a incerteza se acumula. No segundo ano a faixa de 95% fica larga demais para orientar decisão; o primeiro ano é a parte útil.
+
+**5. UFs que dariam SARIMA diferente.** A tabela de comparação confirma que o perfil econômico muda o modelo. Estados de fronteira agrícola e de crescimento rápido (Tocantins, Roraima, Mato Grosso, com 4,5% a 9% ao ano) saem **sem diferença regular** (d = 0): a diferença sazonal mais termos AR de ordem 2 ou 3 já absorvem o crescimento, que é forte mas regular. O pico de dezembro também é mais fraco lá (15% a 19% acima da média do ano, contra 26% em Pernambuco), porque veículos e material de construção ligados à safra pesam mais que o Natal no varejo ampliado. São Paulo, mais diversificado, cai num modelo próximo do airline, como Pernambuco. Eu esperava séries mais ruidosas nos estados pequenos do Norte, mas os dados não confirmam: o choque relativo de Roraima é até menor que o de Pernambuco.
